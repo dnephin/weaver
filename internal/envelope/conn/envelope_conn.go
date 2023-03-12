@@ -43,7 +43,7 @@ type EnvelopeHandler interface {
 type EnvelopeConn struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
-	conn      conn
+	conn      Conn
 	metrics   metrics.Importer
 	weavelet  *protos.WeaveletInfo
 	running   errgroup.Group
@@ -67,23 +67,23 @@ func NewEnvelopeConn(ctx context.Context, r io.ReadCloser, w io.WriteCloser, inf
 	e := &EnvelopeConn{
 		ctx:       ctx,
 		ctxCancel: cancel,
-		conn:      conn{name: "envelope", reader: r, writer: w},
+		conn:      NewConn("envelope", r, w),
 	}
 
 	// Perform the handshake. Send EnvelopeInfo and receive WeaveletInfo.
-	if err := e.conn.send(&protos.EnvelopeMsg{EnvelopeInfo: info}); err != nil {
-		e.conn.cleanup(err)
+	if err := e.conn.Send(&protos.EnvelopeMsg{EnvelopeInfo: info}); err != nil {
+		e.conn.Cleanup(err)
 		return nil, err
 	}
 	reply := &protos.WeaveletMsg{}
-	if err := e.conn.recv(reply); err != nil {
-		e.conn.cleanup(err)
+	if err := e.conn.Recv(reply); err != nil {
+		e.conn.Cleanup(err)
 		return nil, err
 	}
 	if reply.WeaveletInfo == nil {
 		err := fmt.Errorf(
 			"the first message from the weavelet must contain weavelet info")
-		e.conn.cleanup(err)
+		e.conn.Cleanup(err)
 		return nil, err
 	}
 	e.weavelet = reply.WeaveletInfo
@@ -119,7 +119,7 @@ func NewEnvelopeConn(ctx context.Context, r io.ReadCloser, w io.WriteCloser, inf
 	e.running.Go(func() error {
 		for {
 			msg := &protos.WeaveletMsg{}
-			if err := e.conn.recv(msg); err != nil {
+			if err := e.conn.Recv(msg); err != nil {
 				e.stop(err)
 				return err
 			}
@@ -146,7 +146,7 @@ func (e *EnvelopeConn) stop(err error) {
 	})
 
 	e.ctxCancel()
-	e.conn.cleanup(err)
+	e.conn.Cleanup(err)
 }
 
 // Serve accepts incoming messages from the weavelet. RPC requests are handled
@@ -200,21 +200,21 @@ func (e *EnvelopeConn) handleMessage(msg *protos.WeaveletMsg, h EnvelopeHandler)
 	switch {
 	case msg.ActivateComponentRequest != nil:
 		reply, err := h.ActivateComponent(e.ctx, msg.ActivateComponentRequest)
-		return e.conn.send(&protos.EnvelopeMsg{
+		return e.conn.Send(&protos.EnvelopeMsg{
 			Id:                     -msg.Id,
 			Error:                  errstring(err),
 			ActivateComponentReply: reply,
 		})
 	case msg.GetListenerAddressRequest != nil:
 		reply, err := h.GetListenerAddress(e.ctx, msg.GetListenerAddressRequest)
-		return e.conn.send(&protos.EnvelopeMsg{
+		return e.conn.Send(&protos.EnvelopeMsg{
 			Id:                      -msg.Id,
 			Error:                   errstring(err),
 			GetListenerAddressReply: reply,
 		})
 	case msg.ExportListenerRequest != nil:
 		reply, err := h.ExportListener(e.ctx, msg.ExportListenerRequest)
-		return e.conn.send(&protos.EnvelopeMsg{
+		return e.conn.Send(&protos.EnvelopeMsg{
 			Id:                  -msg.Id,
 			Error:               errstring(err),
 			ExportListenerReply: reply,
@@ -229,7 +229,7 @@ func (e *EnvelopeConn) handleMessage(msg *protos.WeaveletMsg, h EnvelopeHandler)
 		return h.HandleTraceSpans(e.ctx, traces)
 	default:
 		err := fmt.Errorf("envelope_conn: unexpected message %+v", msg)
-		e.conn.cleanup(err)
+		e.conn.Cleanup(err)
 		return err
 	}
 }
@@ -327,7 +327,7 @@ func (e *EnvelopeConn) rpc(request *protos.EnvelopeMsg) (*protos.WeaveletMsg, er
 	response, err := e.conn.doBlockingRPC(request)
 	if err != nil {
 		err := fmt.Errorf("connection to weavelet broken: %w", err)
-		e.conn.cleanup(err)
+		e.conn.Cleanup(err)
 		return nil, err
 	}
 	msg, ok := response.(*protos.WeaveletMsg)
