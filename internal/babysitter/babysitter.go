@@ -197,7 +197,7 @@ func (b *Babysitter) StartComponent(req *protos.ComponentToStart) error {
 	if err != nil {
 		return err
 	}
-	g := b.findOrAddGroup(state, req.ColocationGroup)
+	g := state.FindOrAddGroup(req.ColocationGroup)
 
 	// Update routing information.
 	g.Components[req.Component] = req.IsRouted
@@ -232,7 +232,7 @@ func (b *Babysitter) RegisterReplica(req *protos.ReplicaToRegister) error {
 	if err != nil {
 		return err
 	}
-	g := b.findOrAddGroup(state, req.Group)
+	g := state.FindOrAddGroup(req.Group)
 
 	// Append the replica, if not already appended.
 	var found bool
@@ -264,7 +264,7 @@ func (b *Babysitter) GetComponentsToStart(req *protos.GetComponentsToStart) (*pr
 	if err != nil {
 		return nil, err
 	}
-	g := b.findOrAddGroup(state, req.Group)
+	g := state.FindOrAddGroup(req.Group)
 
 	// Return the components.
 	var reply protos.ComponentsToStart
@@ -382,13 +382,13 @@ func (b *AppState) Update(state *AppVersionState) {
 	b.appState.Update(appVersionStateKey, state)
 }
 
-func (b *Babysitter) findOrAddGroup(state *AppVersionState, group string) *ColocationGroupState {
-	g := state.Groups[group]
+func (x *AppVersionState) FindOrAddGroup(group string) *ColocationGroupState {
+	g := x.Groups[group]
 	if g == nil {
 		g = &ColocationGroupState{
 			Name: group,
 		}
-		state.Groups[group] = g
+		x.Groups[group] = g
 	}
 	// TODO(spetrovic): Versioned map stores empty maps as nil maps.
 	// This means that it's not enough to initialize empty maps when
