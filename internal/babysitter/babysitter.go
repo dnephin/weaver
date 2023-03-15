@@ -84,11 +84,11 @@ type Babysitter struct {
 	// statsProcessor tracks and computes stats to be rendered on the /statusz page.
 	statsProcessor *imetrics.StatsProcessor
 
-	mu           sync.RWMutex
-	managed      map[string][]*envelope.Envelope // replica envelopes, by group
-	appState     *versioned.Map[*AppVersionState]
-	routingState *versioned.Map[*protos.RoutingInfo]
-	proxies      map[string]*proxyInfo // proxies, by listener name
+	mu       sync.RWMutex
+	managed  map[string][]*envelope.Envelope // replica envelopes, by group
+	appState *versioned.Map[*AppVersionState]
+	proxies  map[string]*proxyInfo // proxies, by listener name
+	routing  Routing
 }
 
 type proxyInfo struct {
@@ -129,7 +129,7 @@ func NewBabysitter(ctx context.Context, dep *protos.Deployment, logSaver func(*p
 		dep:            dep,
 		managed:        map[string][]*envelope.Envelope{},
 		appState:       versioned.NewMap[*AppVersionState](),
-		routingState:   versioned.NewMap[*protos.RoutingInfo](),
+		routing:        NewRouting(),
 		proxies:        map[string]*proxyInfo{},
 	}
 	go b.statsProcessor.CollectMetrics(b.ctx, b.readMetrics)
@@ -205,7 +205,7 @@ func (b *Babysitter) StartComponent(req *protos.ComponentToStart) error {
 			}
 		}
 	}
-	if err := b.mayGenerateNewRoutingInfo(g); err != nil {
+	if err := b.routing.GenerateNewRoutingInfo(b.ctx, g); err != nil {
 		return err
 	}
 
@@ -242,7 +242,7 @@ func (b *Babysitter) RegisterReplica(req *protos.ReplicaToRegister) error {
 	}
 
 	// Generate routing info, now that the replica set has changed.
-	if err := b.mayGenerateNewRoutingInfo(g); err != nil {
+	if err := b.routing.GenerateNewRoutingInfo(b.ctx, g); err != nil {
 		return err
 	}
 
@@ -334,7 +334,11 @@ func (b *Babysitter) ExportListener(req *protos.ExportListenerRequest) (*protos.
 
 // GetRoutingInfo implements the protos.EnvelopeHandler interface.
 func (b *Babysitter) GetRoutingInfo(req *protos.GetRoutingInfo) (*protos.RoutingInfo, error) {
-	state, newVersion, err := b.loadRoutingState(req.Group, req.Version)
+	return b.routing.GetRoutingInfo(b.ctx, req)
+}
+
+func (b *Routing) GetRoutingInfo(ctx context.Context, req *protos.GetRoutingInfo) (*protos.RoutingInfo, error) {
+	state, newVersion, err := b.loadRoutingState(ctx, req.Group, req.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +509,15 @@ func (b *Babysitter) Metrics(ctx context.Context) (*status.Metrics, error) {
 	return m, nil
 }
 
-// mayGenerateNewRoutingInfo may generate new routing information for a given
+type Routing struct {
+	state *versioned.Map[*protos.RoutingInfo]
+}
+
+func NewRouting() Routing {
+	return Routing{state: versioned.NewMap[*protos.RoutingInfo]()}
+}
+
+// GenerateNewRoutingInfo may generate new routing information for a given
 // colocation group.
 //
 // This method is called whenever (1) the colocation group starts managing
@@ -513,7 +525,7 @@ func (b *Babysitter) Metrics(ctx context.Context) (*status.Metrics, error) {
 // started.
 //
 // REQUIRES: b.mu is held.
-func (b *Babysitter) mayGenerateNewRoutingInfo(g *ColocationGroupState) error {
+func (b *Routing) GenerateNewRoutingInfo(ctx context.Context, g *ColocationGroupState) error {
 	for component, assignment := range g.Assignments {
 		newAssignment, err := routingAlgo(assignment, g.Replicas)
 		if err != nil || newAssignment == nil {
@@ -530,26 +542,26 @@ func (b *Babysitter) mayGenerateNewRoutingInfo(g *ColocationGroupState) error {
 	for _, assignment := range g.Assignments {
 		info.Assignments = append(info.Assignments, assignment)
 	}
-	return b.updateRoutingInfo(g, &info)
+	return b.updateRoutingInfo(ctx, g, &info)
 }
 
 // updateRoutingInfo update the state with the latest routing info for a
 // colocation group.
 // REQUIRES: b.mu is held.
-func (b *Babysitter) updateRoutingInfo(g *ColocationGroupState, info *protos.RoutingInfo) error {
-	state, _, err := b.loadRoutingState(g.Name, "" /*version*/)
+func (b *Routing) updateRoutingInfo(ctx context.Context, g *ColocationGroupState, info *protos.RoutingInfo) error {
+	state, _, err := b.loadRoutingState(ctx, g.Name, "" /*version*/)
 	if err != nil {
 		return err
 	}
 	if proto.Equal(state, info) { // Nothing to update
 		return nil
 	}
-	b.routingState.Update(routingKey(g.Name), info)
+	b.state.Update(routingKey(g.Name), info)
 	return nil
 }
 
-func (b *Babysitter) loadRoutingState(group, version string) (*protos.RoutingInfo, string, error) {
-	state, newVersion, err := b.routingState.Read(b.ctx, routingKey(group), version)
+func (b *Routing) loadRoutingState(ctx context.Context, group, version string) (*protos.RoutingInfo, string, error) {
+	state, newVersion, err := b.state.Read(ctx, routingKey(group), version)
 	if err != nil {
 		return nil, "", err
 	}
