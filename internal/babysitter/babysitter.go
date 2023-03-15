@@ -86,9 +86,9 @@ type Babysitter struct {
 
 	mu       sync.RWMutex
 	managed  map[string][]*envelope.Envelope // replica envelopes, by group
-	appState *versioned.Map[*AppVersionState]
-	proxies  map[string]*proxyInfo // proxies, by listener name
+	proxies  map[string]*proxyInfo           // proxies, by listener name
 	routing  Routing
+	appState AppState
 }
 
 type proxyInfo struct {
@@ -128,9 +128,15 @@ func NewBabysitter(ctx context.Context, dep *protos.Deployment, logSaver func(*p
 		opts:           envelope.Options{Restart: envelope.Never, Retry: retry.DefaultOptions},
 		dep:            dep,
 		managed:        map[string][]*envelope.Envelope{},
-		appState:       versioned.NewMap[*AppVersionState](),
-		routing:        NewRouting(),
-		proxies:        map[string]*proxyInfo{},
+		appState: NewAppState(func() *AppVersionState {
+			return &AppVersionState{
+				App:            dep.App.Name,
+				DeploymentId:   dep.Id,
+				SubmissionTime: timestamppb.Now(),
+			}
+		}),
+		routing: NewRouting(),
+		proxies: map[string]*proxyInfo{},
 	}
 	go b.statsProcessor.CollectMetrics(b.ctx, b.readMetrics)
 	return b, nil
@@ -187,7 +193,7 @@ func (b *Babysitter) StartComponent(req *protos.ComponentToStart) error {
 	defer b.mu.Unlock()
 
 	// Load app state.
-	state, _, err := b.loadAppState("" /*version*/)
+	state, _, err := b.appState.Load(b.ctx, "" /*version*/)
 	if err != nil {
 		return err
 	}
@@ -210,7 +216,7 @@ func (b *Babysitter) StartComponent(req *protos.ComponentToStart) error {
 	}
 
 	// Store app state
-	b.appState.Update(appVersionStateKey, state)
+	b.appState.Update(state)
 
 	// Start the colocation group, if it hasn't already started.
 	return b.startColocationGroup(&protos.ColocationGroup{Name: req.ColocationGroup})
@@ -222,7 +228,7 @@ func (b *Babysitter) RegisterReplica(req *protos.ReplicaToRegister) error {
 	defer b.mu.Unlock()
 
 	// Load app state.
-	state, _, err := b.loadAppState("" /*version*/)
+	state, _, err := b.appState.Load(b.ctx, "" /*version*/)
 	if err != nil {
 		return err
 	}
@@ -247,14 +253,14 @@ func (b *Babysitter) RegisterReplica(req *protos.ReplicaToRegister) error {
 	}
 
 	// Store app state.
-	b.appState.Update(appVersionStateKey, state)
+	b.appState.Update(state)
 	return nil
 }
 
 // GetComponentsToStart implements the protos.EnvelopeHandler interface.
 func (b *Babysitter) GetComponentsToStart(req *protos.GetComponentsToStart) (*protos.ComponentsToStart, error) {
 	// Load app state.
-	state, newVersion, err := b.loadAppState(req.Version)
+	state, newVersion, err := b.appState.Load(b.ctx, req.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -296,14 +302,14 @@ func (b *Babysitter) ExportListener(req *protos.ExportListenerRequest) (*protos.
 	defer b.mu.Unlock()
 
 	// Load app state.
-	state, _, err := b.loadAppState("" /*version*/)
+	state, _, err := b.appState.Load(b.ctx, "" /*version*/)
 	if err != nil {
 		return nil, err
 	}
 
 	// Update and store the state.
 	state.Listeners = append(state.Listeners, req.Listener)
-	b.appState.Update(appVersionStateKey, state)
+	b.appState.Update(state)
 
 	// Update the proxy.
 	if p, ok := b.proxies[req.Listener.Name]; ok {
@@ -346,17 +352,22 @@ func (b *Routing) GetRoutingInfo(ctx context.Context, req *protos.GetRoutingInfo
 	return state, nil
 }
 
-func (b *Babysitter) loadAppState(version string) (*AppVersionState, string, error) {
-	state, newVersion, err := b.appState.Read(b.ctx, appVersionStateKey, version)
+type AppState struct {
+	appState *versioned.Map[*AppVersionState]
+	initial  func() *AppVersionState
+}
+
+func NewAppState(initial func() *AppVersionState) AppState {
+	return AppState{initial: initial, appState: versioned.NewMap[*AppVersionState]()}
+}
+
+func (b *AppState) Load(ctx context.Context, version string) (*AppVersionState, string, error) {
+	state, newVersion, err := b.appState.Read(ctx, appVersionStateKey, version)
 	if err != nil {
 		return nil, "", err
 	}
 	if state == nil {
-		state = &AppVersionState{
-			App:            b.dep.App.Name,
-			DeploymentId:   b.dep.Id,
-			SubmissionTime: timestamppb.Now(),
-		}
+		state = b.initial()
 	}
 	// TODO(spetrovic): Versioned map stores empty maps as nil maps.
 	// This means that it's not enough to initialize empty maps when
@@ -365,6 +376,10 @@ func (b *Babysitter) loadAppState(version string) (*AppVersionState, string, err
 		state.Groups = map[string]*ColocationGroupState{}
 	}
 	return state, newVersion, nil
+}
+
+func (b *AppState) Update(state *AppVersionState) {
+	b.appState.Update(appVersionStateKey, state)
 }
 
 func (b *Babysitter) findOrAddGroup(state *AppVersionState, group string) *ColocationGroupState {
@@ -433,7 +448,7 @@ func (b *Babysitter) Profile(_ context.Context, req *protos.RunProfiling) (*prot
 
 // Status implements the status.Server interface.
 func (b *Babysitter) Status(ctx context.Context) (*status.Status, error) {
-	state, _, err := b.loadAppState("" /*version*/)
+	state, _, err := b.appState.Load(ctx, "" /*version*/)
 	if err != nil {
 		return nil, err
 	}
