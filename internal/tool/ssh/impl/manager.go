@@ -18,14 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"sort"
 	"sync"
 	"syscall"
 
@@ -35,20 +32,19 @@ import (
 	"github.com/ServiceWeaver/weaver/runtime/perfetto"
 	"github.com/ServiceWeaver/weaver/runtime/protos"
 	"golang.org/x/exp/maps"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	bbsit "github.com/ServiceWeaver/weaver/internal/babysitter"
 	"github.com/ServiceWeaver/weaver/internal/logtype"
 	"github.com/ServiceWeaver/weaver/internal/proto"
 	"github.com/ServiceWeaver/weaver/internal/proxy"
 	"github.com/ServiceWeaver/weaver/internal/status"
 	"github.com/ServiceWeaver/weaver/internal/traceio"
-	"github.com/ServiceWeaver/weaver/internal/versioned"
 	"github.com/ServiceWeaver/weaver/runtime/logging"
 	"github.com/ServiceWeaver/weaver/runtime/protomsg"
 	"github.com/ServiceWeaver/weaver/runtime/retry"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/sdk/trace"
-	gproto "google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -65,12 +61,6 @@ const (
 	// babysitterInfoKey is the name of the env variable that contains deployment
 	// information for a babysitter deployed using SSH.
 	babysitterInfoKey = "SERVICEWEAVER_BABYSITTER_INFO"
-
-	// routingInfoKey is the key where we track routing information for a given process.
-	routingInfoKey = "routing_entries"
-
-	// appVersionStateKey is the key where we track the state for a given application version.
-	appVersionStateKey = "app_version_state"
 )
 
 // manager manages an application version deployment across a set of locations,
@@ -107,12 +97,12 @@ type manager struct {
 	// statsProcessor tracks and computes stats to be rendered on the /statusz page.
 	statsProcessor *imetrics.StatsProcessor
 
-	mu           sync.Mutex
-	started      map[string]bool //  colocation groups started, by group name
-	appState     *versioned.Map[*AppVersionState]
-	routingState *versioned.Map[*protos.RoutingInfo]
-	proxies      map[string]*proxyInfo                         // proxies, by listener name
-	metrics      map[groupReplicaInfo][]*protos.MetricSnapshot // latest metrics, by group name and replica id
+	mu       sync.Mutex
+	started  map[string]bool //  colocation groups started, by group name
+	routing  bbsit.Routing
+	appState bbsit.AppState
+	proxies  map[string]*proxyInfo                         // proxies, by listener name
+	metrics  map[groupReplicaInfo][]*protos.MetricSnapshot // latest metrics, by group name and replica id
 }
 
 type proxyInfo struct {
@@ -168,10 +158,16 @@ func RunManager(ctx context.Context, dep *protos.Deployment, locations []string,
 		traceSaver:     traceSaver,
 		statsProcessor: imetrics.NewStatsProcessor(),
 		started:        map[string]bool{},
-		appState:       versioned.NewMap[*AppVersionState](),
-		routingState:   versioned.NewMap[*protos.RoutingInfo](),
-		proxies:        map[string]*proxyInfo{},
-		metrics:        map[groupReplicaInfo][]*protos.MetricSnapshot{},
+		appState: bbsit.NewAppState(func() *bbsit.AppVersionState {
+			return &bbsit.AppVersionState{
+				App:            dep.App.Name,
+				DeploymentId:   dep.Id,
+				SubmissionTime: timestamppb.Now(),
+			}
+		}),
+		routing: bbsit.NewRouting(),
+		proxies: map[string]*proxyInfo{},
+		metrics: map[groupReplicaInfo][]*protos.MetricSnapshot{},
 	}
 
 	go func() {
@@ -258,7 +254,9 @@ func (m *manager) addHTTPHandlers(mux *http.ServeMux) {
 	mux.HandleFunc(registerReplicaURL, protomsg.HandlerDo(m.logger, m.registerReplica))
 	mux.HandleFunc(exportListenerURL, protomsg.HandlerFunc(m.logger, m.exportListener))
 	mux.HandleFunc(startComponentURL, protomsg.HandlerDo(m.logger, m.startComponent))
-	mux.HandleFunc(getRoutingInfoURL, protomsg.HandlerFunc(m.logger, m.getRoutingInfo))
+	mux.HandleFunc(getRoutingInfoURL, protomsg.HandlerFunc(m.logger, func(ctx context.Context, req *protos.GetRoutingInfo) (*protos.RoutingInfo, error) {
+		return m.routing.GetRoutingInfo(ctx, req)
+	}))
 	mux.HandleFunc(recvLogEntryURL, protomsg.HandlerDo(m.logger, m.handleLogEntry))
 	mux.HandleFunc(recvTraceSpansURL, protomsg.HandlerDo(m.logger, m.handleTraceSpans))
 	mux.HandleFunc(recvMetricsURL, protomsg.HandlerDo(m.logger, m.handleRecvMetrics))
@@ -274,7 +272,7 @@ func (m *manager) registerStatusPages(mux *http.ServeMux) {
 // TODO(rgrandl): the implementation is the same as the internal/babysitter.go.
 // See if we can remove duplication.
 func (m *manager) Status(ctx context.Context) (*status.Status, error) {
-	state, _, err := m.loadAppState("" /*version*/)
+	state, _, err := m.appState.Load(ctx, "" /*version*/)
 	if err != nil {
 		return nil, err
 	}
@@ -355,14 +353,14 @@ func (m *manager) Profile(context.Context, *protos.RunProfiling) (*protos.Profil
 	return nil, nil
 }
 
-func (m *manager) getComponentsToStart(_ context.Context, req *protos.GetComponentsToStart) (
+func (m *manager) getComponentsToStart(ctx context.Context, req *protos.GetComponentsToStart) (
 	*protos.ComponentsToStart, error) {
 	// Load app state.
-	state, newVersion, err := m.loadAppState(req.Version)
+	state, newVersion, err := m.appState.Load(ctx, req.Version)
 	if err != nil {
 		return nil, err
 	}
-	g := m.findOrAddGroup(state, req.Group)
+	g := state.FindOrAddGroup(req.Group)
 
 	// Return the components.
 	var reply protos.ComponentsToStart
@@ -376,11 +374,11 @@ func (m *manager) registerReplica(_ context.Context, req *protos.ReplicaToRegist
 	defer m.mu.Unlock()
 
 	// Load app state.
-	state, _, err := m.loadAppState("" /*version*/)
+	state, _, err := m.appState.Load(m.ctx, "" /*version*/)
 	if err != nil {
 		return err
 	}
-	g := m.findOrAddGroup(state, req.Group)
+	g := state.FindOrAddGroup(req.Group)
 
 	// Append the replica, if not already appended.
 	var found bool
@@ -396,12 +394,12 @@ func (m *manager) registerReplica(_ context.Context, req *protos.ReplicaToRegist
 	}
 
 	// Generate routing info, now that the replica set has changed.
-	if err := m.mayGenerateNewRoutingInfo(g); err != nil {
+	if err := m.routing.GenerateNewRoutingInfo(m.ctx, g); err != nil {
 		return err
 	}
 
 	// Store app state.
-	m.appState.Update(appVersionStateKey, state)
+	m.appState.Update(state)
 	return nil
 }
 
@@ -411,14 +409,14 @@ func (m *manager) exportListener(_ context.Context, req *protos.ExportListenerRe
 	defer m.mu.Unlock()
 
 	// Load app state.
-	state, _, err := m.loadAppState("" /*version*/)
+	state, _, err := m.appState.Load(m.ctx, "" /*version*/)
 	if err != nil {
 		return nil, err
 	}
 
 	// Update and store the state.
 	state.Listeners = append(state.Listeners, req.Listener)
-	m.appState.Update(appVersionStateKey, state)
+	m.appState.Update(state)
 
 	// Update the proxy.
 	if p, ok := m.proxies[req.Listener.Name]; ok {
@@ -452,11 +450,11 @@ func (m *manager) startComponent(ctx context.Context, req *protos.ComponentToSta
 	defer m.mu.Unlock()
 
 	// Load app state.
-	state, _, err := m.loadAppState("" /*version*/)
+	state, _, err := m.appState.Load(m.ctx, "" /*version*/)
 	if err != nil {
 		return err
 	}
-	g := m.findOrAddGroup(state, req.ColocationGroup)
+	g := state.FindOrAddGroup(req.ColocationGroup)
 
 	// Update routing information.
 	g.Components[req.Component] = req.IsRouted
@@ -470,12 +468,12 @@ func (m *manager) startComponent(ctx context.Context, req *protos.ComponentToSta
 			}
 		}
 	}
-	if err := m.mayGenerateNewRoutingInfo(g); err != nil {
+	if err := m.routing.GenerateNewRoutingInfo(m.ctx, g); err != nil {
 		return err
 	}
 
 	// Store app state
-	m.appState.Update(appVersionStateKey, state)
+	m.appState.Update(state)
 
 	// Start the colocation group, if it hasn't started already.
 	return m.startColocationGroup(ctx, &protos.ColocationGroup{Name: req.ColocationGroup})
@@ -540,184 +538,6 @@ func (m *manager) startBabysitter(loc string, group *protos.ColocationGroup, rep
 	return cmd.Start()
 }
 
-func (m *manager) getRoutingInfo(_ context.Context, req *protos.GetRoutingInfo) (
-	*protos.RoutingInfo, error) {
-	existing, newVersion, err := m.loadRoutingState(req.Group, req.Version)
-	if err != nil {
-		return nil, err
-	}
-	if existing == nil {
-		existing = &protos.RoutingInfo{}
-	}
-	existing.Version = newVersion
-	return existing, nil
-}
-
-// mayGenerateNewRoutingInfo may generate new routing information for a given
-// colocation group.
-//
-// This method is called whenever (1) the colocation group starts managing
-// new routed components, or (2) a new replica of the colocation group gets
-// started.
-//
-// REQUIRES: m.mu is held.
-func (m *manager) mayGenerateNewRoutingInfo(g *ColocationGroupState) error {
-	for component, currAssignment := range g.Assignments {
-		newAssignment, err := routingAlgo(currAssignment, g.Replicas)
-		if err != nil || newAssignment == nil {
-			continue // don't update assignments
-		}
-		g.Assignments[component] = newAssignment
-	}
-
-	// Update the routing information.
-	sort.Strings(g.Replicas)
-	routingInfo := protos.RoutingInfo{
-		Replicas: g.Replicas,
-	}
-	for _, assignment := range g.Assignments {
-		routingInfo.Assignments = append(routingInfo.Assignments, assignment)
-	}
-	return m.updateRoutingInfo(g, &routingInfo)
-}
-
-// updateRoutingInfo update the state with the latest routing info for a
-// colocation group.
-// REQUIRES: m.mu is held.
-func (m *manager) updateRoutingInfo(g *ColocationGroupState, info *protos.RoutingInfo) error {
-	state, _, err := m.loadRoutingState(g.Name, "" /*version*/)
-	if err != nil {
-		return err
-	}
-	if gproto.Equal(state, info) { // Nothing to update
-		return nil
-	}
-	m.routingState.Update(routingKey(g.Name), info)
-	return nil
-}
-
-func (m *manager) loadRoutingState(group, version string) (*protos.RoutingInfo, string, error) {
-	state, newVersion, err := m.routingState.Read(m.ctx, routingKey(group), version)
-	if err != nil {
-		return nil, "", err
-	}
-	if state == nil {
-		state = &protos.RoutingInfo{}
-	}
-	return state, newVersion, nil
-}
-
-// routingAlgo is an implementation of a routing algorithm that distributes the
-// entire key space approximately equally across all healthy resources.
-//
-// The algorithm is as follows:
-// - split the entire key space in a number of slices that is more likely to
-// spread uniformly the key space among all healthy resources
-//
-// - distribute the slices round robin across all healthy resources
-func routingAlgo(currAssignment *protos.Assignment, candidates []string) (*protos.Assignment, error) {
-	newAssignment := protomsg.Clone(currAssignment)
-	newAssignment.Version++
-
-	// Note that the healthy resources should be sorted. This is required because
-	// we want to do a deterministic assignment of slices to resources among
-	// different invocations, to avoid unnecessary churn while generating
-	// new assignments.
-	sort.Strings(candidates)
-
-	if len(candidates) == 0 {
-		newAssignment.Slices = nil
-		return newAssignment, nil
-	}
-
-	const minSliceKey = 0
-	const maxSliceKey = math.MaxUint64
-
-	// If there is only one healthy resource, assign the entire key space to it.
-	if len(candidates) == 1 {
-		newAssignment.Slices = []*protos.Assignment_Slice{
-			{Start: minSliceKey, Replicas: candidates},
-		}
-		return newAssignment, nil
-	}
-
-	// Compute the total number of slices in the assignment.
-	numSlices := nextPowerOfTwo(len(candidates))
-
-	// Split slices in equal subslices in order to generate numSlices.
-	splits := [][]uint64{{minSliceKey, maxSliceKey}}
-	var curr []uint64
-	for ok := true; ok; ok = len(splits) != numSlices {
-		curr, splits = splits[0], splits[1:]
-		midPoint := curr[0] + uint64(math.Floor(0.5*float64(curr[1]-curr[0])))
-		splitl := []uint64{curr[0], midPoint}
-		splitr := []uint64{midPoint, curr[1]}
-		splits = append(splits, splitl, splitr)
-	}
-
-	// Sort the computed slices in increasing order based on the start key, in
-	// order to provide a deterministic assignment across multiple runs, hence to
-	// minimize churn.
-	sort.Slice(splits, func(i, j int) bool {
-		return splits[i][0] <= splits[j][0]
-	})
-
-	// Assign the computed slices to resources in a round robin fashion.
-	slices := make([]*protos.Assignment_Slice, len(splits))
-	rId := 0
-	for i, s := range splits {
-		slices[i] = &protos.Assignment_Slice{
-			Start:    s[0],
-			Replicas: []string{candidates[rId]},
-		}
-		rId = (rId + 1) % len(candidates)
-	}
-	newAssignment.Slices = slices
-	return newAssignment, nil
-}
-
-func (m *manager) loadAppState(version string) (*AppVersionState, string, error) {
-	state, newVersion, err := m.appState.Read(m.ctx, appVersionStateKey, version)
-	if err != nil {
-		return nil, "", err
-	}
-	if state == nil {
-		state = &AppVersionState{
-			App:            m.dep.App.Name,
-			DeploymentId:   m.dep.Id,
-			SubmissionTime: timestamppb.Now(),
-			Groups:         map[string]*ColocationGroupState{},
-		}
-	}
-	// TODO(spetrovic): Versioned map stores empty maps as nil maps.
-	// This means that it's not enough to initialize empty maps when
-	// creating the new AppVersionState above.
-	if state.Groups == nil {
-		state.Groups = map[string]*ColocationGroupState{}
-	}
-	return state, newVersion, nil
-}
-
-func (m *manager) findOrAddGroup(state *AppVersionState, group string) *ColocationGroupState {
-	g := state.Groups[group]
-	if g == nil {
-		g = &ColocationGroupState{
-			Name: group,
-		}
-		state.Groups[group] = g
-	}
-	// TODO(spetrovic): Versioned map stores empty maps as nil maps.
-	// This means that it's not enough to initialize empty maps when
-	// creating the new ColocationGroupState above.
-	if g.Components == nil {
-		g.Components = map[string]bool{}
-	}
-	if g.Assignments == nil {
-		g.Assignments = map[string]*protos.Assignment{}
-	}
-	return g
-}
-
 // serveHTTP serves HTTP traffic on the provided listener using the provided
 // handler. The server is shut down when then provided context is cancelled.
 func serveHTTP(ctx context.Context, lis net.Listener, handler http.Handler) error {
@@ -741,17 +561,4 @@ func DefaultRegistry(ctx context.Context) (*status.Registry, error) {
 		return nil, err
 	}
 	return status.NewRegistry(ctx, filepath.Join(dir, "ssh_registry"))
-}
-
-// nextPowerOfTwo returns the next power of 2 that is greater or equal to x.
-func nextPowerOfTwo(x int) int {
-	// If x is already power of 2, return x.
-	if x&(x-1) == 0 {
-		return x
-	}
-	return int(math.Pow(2, math.Ceil(math.Log2(float64(x)))))
-}
-
-func routingKey(group string) string {
-	return path.Join(routingInfoKey, group)
 }
