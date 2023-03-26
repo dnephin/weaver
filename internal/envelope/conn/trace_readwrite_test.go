@@ -24,6 +24,7 @@ import (
 
 	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/internal/traceio"
+	"github.com/ServiceWeaver/weaver/runtime/envelope"
 	"github.com/ServiceWeaver/weaver/runtime/protos"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
@@ -33,14 +34,14 @@ import (
 )
 
 type pipeForTest struct {
-	envelopeConn *conn.EnvelopeConn
+	envelopeConn *envelope.EnvelopeConn
 	wletConn     *conn.WeaveletConn
 
 	waitToExportSpans sync.WaitGroup // wait for trace spans to be exported
 	spans             []sdk.ReadOnlySpan
 }
 
-var _ conn.EnvelopeHandler = &pipeForTest{}
+var _ envelope.EnvelopeHandler = &pipeForTest{}
 
 func (p *pipeForTest) HandleTraceSpans(_ context.Context, spans []trace.ReadOnlySpan) error {
 	p.spans = spans

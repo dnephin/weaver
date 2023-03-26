@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/internal/pipe"
 	"github.com/ServiceWeaver/weaver/runtime"
 	"github.com/ServiceWeaver/weaver/runtime/metrics"
@@ -58,12 +57,6 @@ type EnvelopeHandler interface {
 	HandleTraceSpans(context.Context, []trace.ReadOnlySpan) error
 }
 
-// Ensure that EnvelopeHandler remains in-sync with conn.EnvelopeHandler.
-var (
-	_ EnvelopeHandler      = conn.EnvelopeHandler(nil)
-	_ conn.EnvelopeHandler = EnvelopeHandler(nil)
-)
-
 // Envelope starts and manages a weavelet in a subprocess.
 //
 // For more information, refer to runtime/protos/runtime.proto and
@@ -74,10 +67,10 @@ type Envelope struct {
 	ctxCancel  context.CancelFunc
 	weavelet   *protos.EnvelopeInfo
 	config     *protos.AppConfig
-	conn       *conn.EnvelopeConn // conn to weavelet
-	cmd        *pipe.Cmd          // command that started the weavelet
-	stdoutPipe io.ReadCloser      // stdout pipe from the weavelet
-	stderrPipe io.ReadCloser      // stderr pipe from the weavelet
+	conn       *EnvelopeConn // conn to weavelet
+	cmd        *pipe.Cmd     // command that started the weavelet
+	stdoutPipe io.ReadCloser // stdout pipe from the weavelet
+	stderrPipe io.ReadCloser // stderr pipe from the weavelet
 
 	mu        sync.Mutex // guards the following fields
 	profiling bool       // are we currently collecting a profile?
@@ -135,7 +128,7 @@ func NewEnvelope(ctx context.Context, wlet *protos.EnvelopeInfo, config *protos.
 	}
 
 	// Create the connection, now that the weavelet is running.
-	conn, err := conn.NewEnvelopeConn(e.ctx, toEnvelope, toWeavelet, e.weavelet)
+	conn, err := NewEnvelopeConn(e.ctx, toEnvelope, toWeavelet, e.weavelet)
 	if err != nil {
 		return nil, err
 	}

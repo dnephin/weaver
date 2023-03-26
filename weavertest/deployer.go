@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/ServiceWeaver/weaver"
-	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/runtime"
 	"github.com/ServiceWeaver/weaver/runtime/colors"
 	"github.com/ServiceWeaver/weaver/runtime/envelope"
@@ -102,8 +101,8 @@ type handler struct {
 // might not be worth it.
 type connection struct {
 	// One of the following fields will be nil.
-	envelope *envelope.Envelope // envelope to non-main weavelet
-	conn     *conn.EnvelopeConn // conn to main weavelet
+	envelope *envelope.Envelope     // envelope to non-main weavelet
+	conn     *envelope.EnvelopeConn // conn to main weavelet
 }
 
 var _ envelope.EnvelopeHandler = &handler{}
@@ -182,14 +181,14 @@ func (d *deployer) Init(config string) weaver.Instance {
 		SingleMachine: d.wlet.SingleMachine,
 		RunMain:       true,
 	}
-	var e *conn.EnvelopeConn
+	var e *envelope.EnvelopeConn
 	created := make(chan struct{})
 	go func() {
 		// NOTE: We must create the envelope conn in a separate gorotuine
 		// because it initiates a blocking handshake with the weavelet
 		// (initialized below via weaver.Init).
 		var err error
-		if e, err = conn.NewEnvelopeConn(
+		if e, err = envelope.NewEnvelopeConn(
 			d.ctx, fromWeaveletReader, toWeaveletWriter, wlet); err != nil {
 			panic(fmt.Errorf("cannot create envelope conn: %w", err))
 		}

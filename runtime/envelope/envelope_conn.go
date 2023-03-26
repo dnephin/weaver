@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package conn
+package envelope
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/internal/queue"
 	"github.com/ServiceWeaver/weaver/internal/traceio"
 	"github.com/ServiceWeaver/weaver/runtime/metrics"
@@ -28,22 +29,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// See envelope.EnvelopeHandler
-type EnvelopeHandler interface {
-	ActivateComponent(context.Context, *protos.ActivateComponentRequest) (*protos.ActivateComponentReply, error)
-	GetListenerAddress(context.Context, *protos.GetListenerAddressRequest) (*protos.GetListenerAddressReply, error)
-	ExportListener(context.Context, *protos.ExportListenerRequest) (*protos.ExportListenerReply, error)
-	HandleLogEntry(context.Context, *protos.LogEntry) error
-	HandleTraceSpans(context.Context, []trace.ReadOnlySpan) error
-}
-
 // EnvelopeConn is the envelope side of the connection between a weavelet and
 // an envelope. For more information, refer to runtime/protos/runtime.proto and
 // https://serviceweaver.dev/blog/deployers.html.
 type EnvelopeConn struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
-	conn      Conn
+	conn      conn.Conn
 	metrics   metrics.Importer
 	weavelet  *protos.WeaveletInfo
 	running   errgroup.Group
@@ -67,7 +59,7 @@ func NewEnvelopeConn(ctx context.Context, r io.ReadCloser, w io.WriteCloser, inf
 	e := &EnvelopeConn{
 		ctx:       ctx,
 		ctxCancel: cancel,
-		conn:      NewConn("envelope", r, w),
+		conn:      conn.NewConn("envelope", r, w),
 	}
 
 	// Perform the handshake. Send EnvelopeInfo and receive WeaveletInfo.
@@ -324,7 +316,7 @@ func (e *EnvelopeConn) UpdateRoutingInfoRPC(routing *protos.RoutingInfo) error {
 }
 
 func (e *EnvelopeConn) rpc(request *protos.EnvelopeMsg) (*protos.WeaveletMsg, error) {
-	response, err := e.conn.doBlockingRPC(request)
+	response, err := e.conn.DoBlockingRPC(request)
 	if err != nil {
 		err := fmt.Errorf("connection to weavelet broken: %w", err)
 		e.conn.Cleanup(err)

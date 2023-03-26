@@ -24,6 +24,7 @@ import (
 
 	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/metrics"
+	"github.com/ServiceWeaver/weaver/runtime/envelope"
 	"github.com/ServiceWeaver/weaver/runtime/protos"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -80,7 +81,7 @@ func TestMetricPropagation(t *testing.T) {
 	checkValue("TestMetricPropagation.hist", 1000)
 }
 
-func makeConnections(t *testing.T, handler conn.EnvelopeHandler) (*conn.EnvelopeConn, *conn.WeaveletConn) {
+func makeConnections(t *testing.T, handler envelope.EnvelopeHandler) (*envelope.EnvelopeConn, *conn.WeaveletConn) {
 	t.Helper()
 
 	// Create the pipes. Note that we use os.Pipe instead of io.Pipe. The pipes
@@ -123,7 +124,7 @@ func makeConnections(t *testing.T, handler conn.EnvelopeHandler) (*conn.Envelope
 
 	}()
 
-	e, err := conn.NewEnvelopeConn(ctx, eReader, eWriter, wlet)
+	e, err := envelope.NewEnvelopeConn(ctx, eReader, eWriter, wlet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +154,7 @@ func makeConnections(t *testing.T, handler conn.EnvelopeHandler) (*conn.Envelope
 
 type handlerForTest struct{}
 
-var _ conn.EnvelopeHandler = &handlerForTest{}
+var _ envelope.EnvelopeHandler = &handlerForTest{}
 
 func (*handlerForTest) HandleTraceSpans(context.Context, []trace.ReadOnlySpan) error {
 	return nil
