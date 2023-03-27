@@ -140,6 +140,22 @@ func NewEnvelope(ctx context.Context, wlet *protos.EnvelopeInfo, config *protos.
 	return e, nil
 }
 
+func NewEnvelopeForTest(ctx context.Context, wlet *protos.EnvelopeInfo, toEnvelope io.ReadCloser, toWeavelet io.WriteCloser) *Envelope {
+	// Create the connection, now that the weavelet is running.
+	conn, err := NewEnvelopeConn(e.ctx, toEnvelope, toWeavelet, e.weavelet)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO:
+	e.cmd = cmd
+	e.conn = conn
+	e.stdoutPipe = outpipe
+	e.stderrPipe = errpipe
+	return e, nil
+
+}
+
 // Serve accepts incoming messages from the weavelet. RPC requests are handled
 // serially in the order they are received. Serve blocks until the connection
 // terminates, returning the error that caused it to terminate. You can cancel

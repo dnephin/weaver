@@ -44,7 +44,7 @@ func TestMetricPropagation(t *testing.T) {
 	var metrics map[string]float64
 	readMetrics := func() {
 		t.Helper()
-		list, err := envelope.GetMetricsRPC()
+		list, err := envelope.ReadMetrics()
 		if err != nil {
 			t.Fatalf("metrics fetch: %v", err)
 		}
@@ -81,7 +81,7 @@ func TestMetricPropagation(t *testing.T) {
 	checkValue("TestMetricPropagation.hist", 1000)
 }
 
-func makeConnections(t *testing.T, handler envelope.EnvelopeHandler) (*envelope.EnvelopeConn, *conn.WeaveletConn) {
+func makeConnections(t *testing.T, handler envelope.EnvelopeHandler) (*envelope.Envelope, *conn.WeaveletConn) {
 	t.Helper()
 
 	// Create the pipes. Note that we use os.Pipe instead of io.Pipe. The pipes
@@ -124,7 +124,7 @@ func makeConnections(t *testing.T, handler envelope.EnvelopeHandler) (*envelope.
 
 	}()
 
-	e, err := envelope.NewEnvelopeConn(ctx, eReader, eWriter, wlet)
+	e, err := envelope.NewEnvelope(ctx, wlet, &protos.AppConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

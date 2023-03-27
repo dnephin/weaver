@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/ServiceWeaver/weaver"
+	"github.com/ServiceWeaver/weaver/internal/envelope/conn"
 	"github.com/ServiceWeaver/weaver/runtime"
 	"github.com/ServiceWeaver/weaver/runtime/colors"
 	"github.com/ServiceWeaver/weaver/runtime/envelope"
@@ -73,36 +74,19 @@ type deployer struct {
 
 // A group contains information about a co-location group.
 type group struct {
-	name        string                  // group name
-	conns       []connection            // connections to the weavelet
-	components  map[string]bool         // started components
-	addresses   map[string]bool         // weavelet addresses
-	subscribers map[string][]connection // routing info subscribers, by component
+	name        string                          // group name
+	conns       []*envelope.Envelope            // connections to the weavelet
+	components  map[string]bool                 // started components
+	addresses   map[string]bool                 // weavelet addresses
+	subscribers map[string][]*envelope.Envelope // routing info subscribers, by component
 }
 
 // handler handles a connection to a weavelet.
 type handler struct {
 	*deployer
 	group      *group
-	conn       connection
+	envelope   *envelope.Envelope
 	subscribed map[string]bool // routing info subscriptions, by component
-}
-
-// A connection is either an Envelope or an EnvelopeConn.
-//
-// The weavertest deployer has to deal with the annoying fact that the main
-// weavelet runs in the same process as the deployer. Thus, the connection to
-// the main weavelet is an EnvelopeConn. On the other hand, the connection to
-// all other weavelets is an Envelope. A connection encapsulates the common
-// logic between the two.
-//
-// TODO(mwhittaker): Can we revise the Envelope API to avoid having to do stuff
-// like this? Having a weavelet run in the same process is rare though, so it
-// might not be worth it.
-type connection struct {
-	// One of the following fields will be nil.
-	envelope *envelope.Envelope     // envelope to non-main weavelet
-	conn     *envelope.EnvelopeConn // conn to main weavelet
 }
 
 var _ envelope.EnvelopeHandler = &handler{}
@@ -171,6 +155,12 @@ func (d *deployer) Init(config string) weaver.Instance {
 	if err != nil {
 		d.t.Fatalf("cannot create toWeavelet pipe: %v", err)
 	}
+
+	envelopeCtx := context.WithValue(d.ctx, conn.ContextKey, conn.IO{
+		Reader: fromWeaveletReader,
+		Writer: toWeaveletWriter,
+	})
+
 	// Run an envelope connection to the main co-location group.
 	wlet := &protos.EnvelopeInfo{
 		App:           d.wlet.App,
@@ -181,15 +171,14 @@ func (d *deployer) Init(config string) weaver.Instance {
 		SingleMachine: d.wlet.SingleMachine,
 		RunMain:       true,
 	}
-	var e *envelope.EnvelopeConn
+	var e *envelope.Envelope
 	created := make(chan struct{})
 	go func() {
 		// NOTE: We must create the envelope conn in a separate gorotuine
 		// because it initiates a blocking handshake with the weavelet
 		// (initialized below via weaver.Init).
 		var err error
-		if e, err = envelope.NewEnvelopeConn(
-			d.ctx, fromWeaveletReader, toWeaveletWriter, wlet); err != nil {
+		if e, err = envelope.NewEnvelope(envelopeCtx, wlet, &protos.AppConfig{}); err != nil {
 			panic(fmt.Errorf("cannot create envelope conn: %w", err))
 		}
 		created <- struct{}{}
@@ -204,12 +193,12 @@ func (d *deployer) Init(config string) weaver.Instance {
 	<-created
 
 	g := d.group("main")
-	g.conns = append(g.conns, connection{conn: e})
+	g.conns = append(g.conns, e)
 	handler := &handler{
 		deployer:   d,
 		group:      g,
 		subscribed: map[string]bool{},
-		conn:       connection{conn: e},
+		envelope:   e,
 	}
 	d.running.Go(func() error {
 		err := e.Serve(handler)
@@ -328,13 +317,13 @@ func (h *handler) ActivateComponent(_ context.Context, req *protos.ActivateCompo
 		if h.group.name == target.name {
 			// Route locally.
 			routing := &protos.RoutingInfo{Component: req.Component, Local: true}
-			if err := h.conn.UpdateRoutingInfo(routing); err != nil {
+			if err := h.envelope.UpdateRoutingInfo(routing); err != nil {
 				return nil, err
 			}
 		} else {
 			// Route remotely.
-			target.subscribers[req.Component] = append(target.subscribers[req.Component], h.conn)
-			if err := h.conn.UpdateRoutingInfo(target.routing(req.Component)); err != nil {
+			target.subscribers[req.Component] = append(target.subscribers[req.Component], h.envelope)
+			if err := h.envelope.UpdateRoutingInfo(target.routing(req.Component)); err != nil {
 				return nil, err
 			}
 		}
@@ -385,9 +374,8 @@ func (d *deployer) startGroup(g *group) error {
 		if err := e.UpdateComponents(components); err != nil {
 			return err
 		}
-		c := connection{envelope: e}
-		handler.conn = c
-		g.conns = append(g.conns, c)
+		handler.envelope = e
+		g.conns = append(g.conns, e)
 	}
 	return nil
 }
@@ -407,7 +395,7 @@ func (d *deployer) group(component string) *group {
 			name:        name,
 			components:  map[string]bool{},
 			addresses:   map[string]bool{},
-			subscribers: map[string][]connection{},
+			subscribers: map[string][]*envelope.Envelope{},
 		}
 		d.groups[name] = g
 	}
@@ -422,26 +410,4 @@ func (g *group) routing(component string) *protos.RoutingInfo {
 		Component: component,
 		Replicas:  maps.Keys(g.addresses),
 	}
-}
-
-// UpdateRoutingInfo is equivalent to Envelope.UpdateRoutingInfo.
-func (c connection) UpdateRoutingInfo(routing *protos.RoutingInfo) error {
-	if c.envelope != nil {
-		return c.envelope.UpdateRoutingInfo(routing)
-	}
-	if c.conn != nil {
-		return c.conn.UpdateRoutingInfoRPC(routing)
-	}
-	panic(fmt.Errorf("nil connection"))
-}
-
-// UpdateComponents is equivalent to Envelope.UpdateComponents.
-func (c connection) UpdateComponents(components []string) error {
-	if c.envelope != nil {
-		return c.envelope.UpdateComponents(components)
-	}
-	if c.conn != nil {
-		return c.conn.UpdateComponentsRPC(components)
-	}
-	panic(fmt.Errorf("nil connection"))
 }
